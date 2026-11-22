@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 027
+
+CONF="${CONF:-/etc/nfs3-migrate/migration.env}"
+[[ -r "$CONF" ]] || { echo "Missing $CONF" >&2; exit 2; }
+# shellcheck disable=SC1090
+source "$CONF"
+
+: "${SOURCE:?}" "${DEST_HOST:?}" "${DEST_USER:?}" "${DEST_PATH:?}"
+: "${SSH_PORT:=22}" "${SSH_KEY:=/root/.ssh/nfs_migration_ed25519}"
+: "${WORKERS:=12}" "${MAX_WORKERS:=24}"
+: "${RETRY_MAX:=5}" "${RETRY_BASE_SECONDS:=10}" "${STATE_DIR:=/var/lib/nfs3-migrate}"
+: "${LOG_DIR:=/var/log/nfs3-migrate}" "${DB:=$STATE_DIR/migration.sqlite}"
+: "${EXCLUDE_FILE:=}" "${RSYNC_TIMEOUT:=900}" "${PARTIAL_DIR:=.nfs3-migrate-partial}"
+: "${BWLIMIT:=}" "${SSH_CONNECT_TIMEOUT:=30}" "${SSH_CIPHER:=}" "${PRESERVE_XATTRS:=0}"
+: "${FPSYNC_MAX_FILES:=2000}" "${FPSYNC_MAX_BYTES:=2g}"
+: "${FPSYNC_TMPDIR:=$STATE_DIR/fpsync}" "${FPSYNC_SHARED_DIR:=$FPSYNC_TMPDIR}"
+
+mkdir -p "$STATE_DIR"/{runs,manifests} "$LOG_DIR" "$FPSYNC_TMPDIR" "$FPSYNC_SHARED_DIR"
+chgrp -R apache "$STATE_DIR" "$LOG_DIR" 2>/dev/null || true
+chmod 2750 "$STATE_DIR" "$STATE_DIR/runs" "$STATE_DIR/manifests" "$LOG_DIR"
+chgrp apache "$FPSYNC_TMPDIR" "$FPSYNC_SHARED_DIR" 2>/dev/null || true
+chmod 2750 "$FPSYNC_TMPDIR" "$FPSYNC_SHARED_DIR"
+[[ -f "$DB" ]] || sqlite3 "$DB" < /usr/local/share/nfs3-migrate/schema.sql
+chgrp apache "$DB" 2>/dev/null || true
+chmod 0640 "$DB"
+# Lightweight in-place schema upgrades for databases created by earlier package versions.
+for col in total_bytes; do
+  sqlite3 "$DB" "PRAGMA table_info(runs);" | cut -d'|' -f2 | grep -qx "$col" || \
+    sqlite3 "$DB" "ALTER TABLE runs ADD COLUMN $col INTEGER NOT NULL DEFAULT 0;"
+done
+sqlite3 "$DB" "PRAGMA table_info(partitions);" | cut -d'|' -f2 | grep -qx worker_pid || \
+  sqlite3 "$DB" "ALTER TABLE partitions ADD COLUMN worker_pid INTEGER;"
+
+SSH_OPTS=(-p "$SSH_PORT" -i "$SSH_KEY" -o BatchMode=yes -o IdentitiesOnly=yes
+          -o StrictHostKeyChecking=yes -o "ConnectTimeout=$SSH_CONNECT_TIMEOUT")
+[[ -n "$SSH_CIPHER" ]] && SSH_OPTS+=(-c "$SSH_CIPHER")
+RSH="ssh -p $SSH_PORT -i $SSH_KEY -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=$SSH_CONNECT_TIMEOUT"
+[[ -n "$SSH_CIPHER" ]] && RSH+=" -c $SSH_CIPHER"
+
+log() { printf '[%s] %s\n' "$(date -Is)" "$*" | tee -a "$LOG_DIR/controller.log"; }
+die() { log "ERROR: $*"; exit 1; }
+sql() { sqlite3 -batch -cmd ".timeout 30000" "$DB" "$1"; }
+sqlq() { local s=${1//\'/\'\'}; printf "'%s'" "$s"; }
+run_id() { date -u +%Y%m%dT%H%M%S%N; }
+
+preflight() {
+  [[ $EUID -eq 0 ]] || die "Run controller as root to preserve source ownership and metadata."
+  [[ -d "$SOURCE" ]] || die "Source mount missing: $SOURCE"
+  mountpoint -q "$SOURCE" || die "Source is not a mountpoint: $SOURCE"
+  command -v rsync >/dev/null || die "rsync missing"
+  command -v fpart >/dev/null || die "fpart missing"
+  command -v fpsync >/dev/null || die "fpsync missing (install the fpart package that provides fpsync)"
+  command -v bc >/dev/null || die "bc missing (required by fpsync)"
+  command -v sqlite3 >/dev/null || die "sqlite3 missing"
+  [[ "$WORKERS" =~ ^[1-9][0-9]*$ ]] || die "WORKERS invalid"
+  [[ "$MAX_WORKERS" =~ ^[1-9][0-9]*$ ]] || die "MAX_WORKERS invalid"
+  [[ "$FPSYNC_MAX_FILES" =~ ^[1-9][0-9]*$ ]] || die "FPSYNC_MAX_FILES must be a positive integer"
+  [[ "$FPSYNC_MAX_BYTES" =~ ^[1-9][0-9]*[kKmMgGtTpP]?$ ]] || die "FPSYNC_MAX_BYTES must be a positive byte count (e.g. 2g)"
+  [[ "$WORKERS" -le "$MAX_WORKERS" ]] || die "WORKERS exceeds MAX_WORKERS"
+  local remote_check
+  printf -v remote_check 'mountpoint -q %q && findmnt -T %q -n -o FSTYPE,OPTIONS | grep -Eq %q && command -v rsync >/dev/null && sudo -n /usr/bin/rsync --version >/dev/null' "$DEST_PATH" "$DEST_PATH" '^nfs .*vers=3|^nfs3 ' 
+  ssh "${SSH_OPTS[@]}" "$DEST_USER@$DEST_HOST" "$remote_check" \
+    || die "Destination mount/rsync/sudo check failed"
+  # Confirm source is NFS and show effective options.
+  findmnt -T "$SOURCE" -n -o FSTYPE,OPTIONS | grep -Eq '^nfs .*vers=3|^nfs3 ' || die "Source must be mounted as NFSv3"
+  log "Preflight OK. Source NFSv3 mount: $(findmnt -T "$SOURCE" -n -o SOURCE,FSTYPE,OPTIONS)"
+  log "Destination NFSv3 host/path: $DEST_HOST:$DEST_PATH"
+}
+
+# Metadata/permission probe. Requires export policy to allow root ownership operations.
+metadata_probe() {
+  local probe=".nfs3-migrate-probe-$$"
+  local src="$SOURCE/$probe"
+  local dst="$DEST_PATH/$probe"
+  local tmpcopy="$STATE_DIR/probe-copy-$$"
+  trap 'rm -f "$src" "$tmpcopy" 2>/dev/null || true; ssh "${SSH_OPTS[@]}" "$DEST_USER@$DEST_HOST" "sudo -n rm -f -- '\''$dst'\''" >/dev/null 2>&1 || true' RETURN
+  printf 'probe\n' > "$src"
+  chmod 0640 "$src"
+  chown 12345:12345 "$src" || die "Source filesystem does not permit chown probe"
+  rsync -a --numeric-ids -e "$RSH" "$src" \
+    "$DEST_USER@$DEST_HOST:$dst" \
+    --rsync-path="sudo -n /usr/bin/rsync"
+  rsync -a --numeric-ids -e "$RSH" \
+    --rsync-path="sudo -n /usr/bin/rsync" \
+    "$DEST_USER@$DEST_HOST:$dst" "$tmpcopy"
+  local src_meta dst_meta
+  src_meta="$(stat -c '%u:%g:%a' "$src")"
+  dst_meta="$(stat -c '%u:%g:%a' "$tmpcopy")"
+  [[ "$src_meta" == "$dst_meta" ]] || die "UID/GID/mode mismatch: source=$src_meta destination=$dst_meta. Check server-side root-squash/export permissions and filesystem ownership policy."
+  log "Metadata probe passed: UID/GID/mode=$dst_meta"
+  if [[ "$PRESERVE_XATTRS" == "1" ]]; then
+    command -v setfattr >/dev/null || die "attr package required for PRESERVE_XATTRS=1"
+    command -v getfattr >/dev/null || die "attr package required for PRESERVE_XATTRS=1"
+    setfattr -n user.nfs3_migrate_probe -v ok "$src" || die "Source NFS export does not support requested user xattr"
+    rsync -aX --numeric-ids -e "$RSH" "$src" \
+      "$DEST_USER@$DEST_HOST:$dst" --rsync-path="sudo -n /usr/bin/rsync"
+    rsync -aX --numeric-ids -e "$RSH" --rsync-path="sudo -n /usr/bin/rsync" \
+      "$DEST_USER@$DEST_HOST:$dst" "$tmpcopy"
+    [[ "$(getfattr --only-values -n user.nfs3_migrate_probe "$src" 2>/dev/null)" == \
+       "$(getfattr --only-values -n user.nfs3_migrate_probe "$tmpcopy" 2>/dev/null)" ]] \
+       || die "Xattr round-trip failed on generic NFSv3"
+    log "User xattr probe passed"
+  fi
+}
+has_hardlinks() {
+  # This scan is metadata-intensive. Run it on a quiesced snapshot when possible.
+  find "$SOURCE" -xdev -type f -links +1 -print -quit 2>/dev/null | grep -q .
+}
+
+serial_hardlink_sync() {
+  log "Hardlinks detected: switching to one serial rsync -H tree transfer to preserve link relationships."
+  local -a args=(-aH --numeric-ids --whole-file --partial
+    --partial-dir="$PARTIAL_DIR" --timeout="$RSYNC_TIMEOUT" --stats)
+  [[ "$PRESERVE_XATTRS" == "1" ]] && args+=(-X)
+  [[ -n "$BWLIMIT" ]] && args+=(--bwlimit="$BWLIMIT")
+  [[ -n "$EXCLUDE_FILE" && -f "$EXCLUDE_FILE" ]] && args+=(--exclude-from="$EXCLUDE_FILE")
+  local attempt rc=1
+  for ((attempt=1; attempt<=RETRY_MAX; attempt++)); do
+    set +e
+    rsync "${args[@]}" -e "$RSH" "$SOURCE/" \
+      "$DEST_USER@$DEST_HOST:$DEST_PATH/" \
+      --rsync-path="sudo -n /usr/bin/rsync" 2>&1 | tee -a "$LOG_DIR/hardlink-serial.log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    (( rc == 0 )) && return 0
+    log "Serial hardlink transfer failed rc=$rc attempt=$attempt"
+    sleep $(( RETRY_BASE_SECONDS * (2 ** (attempt-1)) ))
+  done
+  return "$rc"
+}
+
+apply_directory_metadata() {
+  log "Applying final directory metadata pass"
+  local -a dargs=(-a --numeric-ids --include='*/' --exclude='*' --exclude='.zfs/' --exclude='.snapshot*/' --exclude='.ckpt/')
+  [[ "$PRESERVE_XATTRS" == "1" ]] && dargs+=(-X)
+  rsync "${dargs[@]}" -e "$RSH" "$SOURCE/" "$DEST_USER@$DEST_HOST:$DEST_PATH/" \
+    --rsync-path="sudo -n /usr/bin/rsync"
+}
+fpsync_start() {
+  local rid="$1" mode="$2" total_bytes=0 fp_log="$LOG_DIR/fpsync-$rid.log"
+  local fpsync_id="" rc=0 tool_opts
+  # fpsync launches local workers on the controller. rsync uses SSH only for
+  # the remote receiver; the destination VM is not an fpsync worker.
+  export RSYNC_RSH="$RSH"
+  tool_opts="-lptgoD --numeric-ids --whole-file --partial --partial-dir=$PARTIAL_DIR --timeout=$RSYNC_TIMEOUT --stats --rsync-path=sudo\ -n\ /usr/bin/rsync"
+  [[ -n "$BWLIMIT" ]] && tool_opts+=" --bwlimit=$BWLIMIT"
+  [[ "$PRESERVE_XATTRS" == "1" ]] && tool_opts+=" -X"
+  [[ -n "$EXCLUDE_FILE" && -f "$EXCLUDE_FILE" ]] && tool_opts+=" --exclude-from=$EXCLUDE_FILE"
+
+  sql "INSERT INTO runs(run_id,mode,status,source,destination,workers,partitions,total_bytes,started_at,notes)
+       VALUES($(sqlq "$rid"),'fpsync','running',$(sqlq "$SOURCE"),
+       $(sqlq "$DEST_USER@$DEST_HOST:$DEST_PATH"),$WORKERS,0,0,datetime('now'),'fpsync run initializing');"
+  log "Starting fpsync run $rid with $WORKERS local workers; max files/job=$FPSYNC_MAX_FILES max bytes/job=$FPSYNC_MAX_BYTES"
+  # Run in background so the controller can persist fpsync's native run ID while
+  # the transfer is still active. That ID is required for native resume.
+  fpsync -v -n "$WORKERS" -f "$FPSYNC_MAX_FILES" -s "$FPSYNC_MAX_BYTES" \
+    -t "$FPSYNC_TMPDIR" -d "$FPSYNC_SHARED_DIR" -o "$tool_opts" \
+    "$SOURCE/" "$DEST_USER@$DEST_HOST:$DEST_PATH/" >>"$fp_log" 2>&1 &
+  local fp_pid=$!
+  for _ in $(seq 1 100); do
+    fpsync_id="$(sed -n 's/.*Info: Run ID: \([0-9][0-9]*-[0-9][0-9]*\).*/\1/p' "$fp_log" | head -n 1)"
+    if [[ -n "$fpsync_id" ]]; then
+      sql "UPDATE runs SET notes=$(sqlq "fpsync_run_id=$fpsync_id; engine=fpsync") WHERE run_id=$(sqlq "$rid");"
+      printf '%s\n' "$fpsync_id" > "$STATE_DIR/active-fpsync-run"
+      chmod 0640 "$STATE_DIR/active-fpsync-run"
+      break
+    fi
+    kill -0 "$fp_pid" 2>/dev/null || break
+    sleep 0.2
+  done
+  set +e
+  wait "$fp_pid"
+  rc=$?
+  set -e
+  if [[ -z "$fpsync_id" ]]; then
+    fpsync_id="$(sed -n 's/.*Info: Run ID: \([0-9][0-9]*-[0-9][0-9]*\).*/\1/p' "$fp_log" | head -n 1)"
+  fi
+  if [[ -n "$fpsync_id" ]]; then
+    local meta="$FPSYNC_SHARED_DIR/parts/$fpsync_id/run.meta"
+    if [[ -r "$meta" ]]; then
+      total_bytes="$(awk -F= '$1=="total_size" {print $2}' "$meta" | tail -n1)"
+      [[ "$total_bytes" =~ ^[0-9]+$ ]] || total_bytes=0
+    fi
+    sql "UPDATE runs SET total_bytes=$total_bytes,partitions=$(find "$FPSYNC_SHARED_DIR/parts/$fpsync_id" -maxdepth 1 -type f -name 'part.*.meta' 2>/dev/null | wc -l),notes=$(sqlq "fpsync_run_id=$fpsync_id; engine=fpsync") WHERE run_id=$(sqlq "$rid");"
+  fi
+  if (( rc == 0 )); then
+    apply_directory_metadata
+    sql "UPDATE runs SET status='completed',finished_at=datetime('now') WHERE run_id=$(sqlq "$rid");"
+    log "fpsync run $rid (engine ID ${fpsync_id:-unknown}) completed"
+    rm -f "$STATE_DIR/active-fpsync-run"
+  else
+    sql "UPDATE runs SET status='completed_with_errors',finished_at=datetime('now'),notes=$(sqlq "fpsync_run_id=${fpsync_id:-unknown}; engine=fpsync; exit=$rc") WHERE run_id=$(sqlq "$rid");"
+    log "fpsync run $rid failed rc=$rc; native fpsync logs: $fp_log"
+    return "$rc"
+  fi
+}
+
+start() {
+  exec 9>/run/nfs3-migrate.lock
+  flock -n 9 || die "Another migration run is active"
+  preflight
+  metadata_probe
+  local rid mode rc=0
+  rid="$(run_id)"
+  if has_hardlinks; then
+    # Hardlinks can span fpart partitions. Preserve them with a serial -H pass.
+    mode="serial-hardlinks"
+    sql "INSERT INTO runs(run_id,mode,status,source,destination,workers,partitions,total_bytes,started_at,notes)
+         VALUES($(sqlq "$rid"),$(sqlq "$mode"),'running',$(sqlq "$SOURCE"),
+         $(sqlq "$DEST_USER@$DEST_HOST:$DEST_PATH"),1,1,0,datetime('now'),'Hardlinks detected; serial rsync -H fallback');"
+    log "Hardlinks detected; using serial rsync -H fallback for correctness"
+    set +e
+    serial_hardlink_sync
+    rc=$?
+    set -e
+    if (( rc == 0 )); then
+      apply_directory_metadata
+      sql "UPDATE runs SET status='completed',finished_at=datetime('now') WHERE run_id=$(sqlq "$rid");"
+    else
+      sql "UPDATE runs SET status='completed_with_errors',finished_at=datetime('now') WHERE run_id=$(sqlq "$rid");"
+      return "$rc"
+    fi
+  else
+    fpsync_start "$rid" "fpsync"
+  fi
+}
+retry() {
+  local rid="${2:-}"
+  [[ -n "$rid" ]] || rid="$(sql "SELECT run_id FROM runs ORDER BY started_at DESC,run_id DESC LIMIT 1;")"
+  [[ -n "$rid" ]] || die "No run found"
+  local mode notes fpsync_id run_status rc=0
+  run_status="$(sql "SELECT status FROM runs WHERE run_id=$(sqlq "$rid");")"
+  [[ "$run_status" != "completed" ]] || die "Run $rid is already completed; use incremental for a fresh inventory/copy pass"
+  mode="$(sql "SELECT mode FROM runs WHERE run_id=$(sqlq "$rid");")"
+  notes="$(sql "SELECT notes FROM runs WHERE run_id=$(sqlq "$rid");")"
+  if [[ "$mode" == "serial-hardlinks" ]]; then
+    serial_hardlink_sync
+    apply_directory_metadata
+  else
+    fpsync_id="$(sed -n 's/.*fpsync_run_id=\([0-9][0-9]*-[0-9][0-9]*\).*/\1/p' <<<"$notes")"
+    [[ -n "$fpsync_id" ]] || die "No native fpsync run ID recorded for $rid; inspect $LOG_DIR/fpsync-$rid.log"
+    export RSYNC_RSH="$RSH"
+    local list statusline
+    list="$(fpsync -l -v -t "$FPSYNC_TMPDIR" -d "$FPSYNC_SHARED_DIR" 2>&1)"
+    statusline="$(grep -F "Run ID: $fpsync_id," <<<"$list" || true)"
+    [[ -n "$statusline" ]] || die "fpsync run $fpsync_id not found in its run store"
+    if grep -q 'resumable' <<<"$statusline"; then
+      log "Resuming incomplete fpsync run $fpsync_id"
+      fpsync -v -r "$fpsync_id" -t "$FPSYNC_TMPDIR" -d "$FPSYNC_SHARED_DIR"
+    elif grep -q 'replayable' <<<"$statusline"; then
+      log "Replaying completed fpsync partitions for run $fpsync_id"
+      fpsync -v -r "$fpsync_id" -R -t "$FPSYNC_TMPDIR" -d "$FPSYNC_SHARED_DIR"
+    else
+      die "fpsync run $fpsync_id is not resumable/replayable; start a fresh incremental run"
+    fi
+    apply_directory_metadata
+  fi
+  sql "UPDATE runs SET status='completed',finished_at=datetime('now') WHERE run_id=$(sqlq "$rid");"
+  rm -f "$STATE_DIR/active-fpsync-run"
+}
+final_sync() {
+  [[ "${SOURCE_QUIESCED:-0}" == "1" ]] || die "Set SOURCE_QUIESCED=1 in migration.env only after application writers are stopped or source snapshot is mounted."
+  start
+}
+
+status() {
+  sql -header -column "SELECT run_id,mode,status,workers,partitions,started_at,finished_at FROM runs ORDER BY started_at DESC,run_id DESC LIMIT 10;"
+  echo
+  echo
+  export RSYNC_RSH="$RSH"
+  fpsync -l -v -t "$FPSYNC_TMPDIR" -d "$FPSYNC_SHARED_DIR" 2>&1 || true
+}
+
+validate_counts() {
+  local rid="${2:-$(sql "SELECT run_id FROM runs ORDER BY started_at DESC,run_id DESC LIMIT 1;")}"
+  [[ -n "$rid" ]] || die "No run found"
+  local out="$LOG_DIR/validation-$rid.txt"
+  local src_files src_dirs dst_counts dst_files dst_dirs
+  src_files="$(find "$SOURCE" -xdev -type f -printf . | wc -c)"
+  src_dirs="$(find "$SOURCE" -xdev -type d -printf . | wc -c)"
+  dst_counts="$(ssh "${SSH_OPTS[@]}" "$DEST_USER@$DEST_HOST" \
+    "find '$DEST_PATH' -xdev -type f -printf . | wc -c; find '$DEST_PATH' -xdev -type d -printf . | wc -c")"
+  dst_files="$(printf '%s\n' "$dst_counts" | sed -n '1p' | tr -d ' ')"
+  dst_dirs="$(printf '%s\n' "$dst_counts" | sed -n '2p' | tr -d ' ')"
+  {
+    echo "Run: $rid"
+    echo "Source files: $src_files"
+    echo "Destination files: $dst_files"
+    echo "Source directories: $src_dirs"
+    echo "Destination directories: $dst_dirs"
+    if [[ "$src_files" == "$dst_files" && "$src_dirs" == "$dst_dirs" ]]; then
+      echo "COUNT_RESULT=PASS"
+    else
+      echo "COUNT_RESULT=DIFFERENT"
+    fi
+  } | tee "$out"
+  [[ "$src_files" == "$dst_files" && "$src_dirs" == "$dst_dirs" ]] || return 1
+}
+validate_checksum() {
+  # Full-tree checksum scan is intentionally serial to limit NFS metadata pressure.
+  local out="$LOG_DIR/checksum-$(date +%Y%m%d%H%M%S).txt"
+  local -a cargs=(-ani --checksum --numeric-ids)
+  [[ "$PRESERVE_XATTRS" == "1" ]] && cargs+=(-X)
+  rsync "${cargs[@]}" -e "$RSH" "$SOURCE/" "$DEST_USER@$DEST_HOST:$DEST_PATH/" \
+    --rsync-path="sudo -n /usr/bin/rsync" | tee "$out"
+  log "Checksum comparison written to $out"
+}
+case "${1:-}" in
+  preflight) preflight ;;
+  probe) preflight; metadata_probe ;;
+  start|incremental) start ;;
+  final-sync) final_sync ;;
+  retry) retry "$@" ;;
+  status) status ;;
+  validate-counts) validate_counts "$@" ;;
+  validate-checksum) validate_checksum ;;
+  *) echo "Usage: $0 {preflight|probe|start|incremental|final-sync|retry [run_id]|status|validate-counts|validate-checksum}"; exit 2 ;;
+esac

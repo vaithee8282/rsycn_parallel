@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+exec /usr/bin/systemd-run --unit=nfs3-migrate-web --collect \
+  /usr/local/sbin/nfs3-migrate start

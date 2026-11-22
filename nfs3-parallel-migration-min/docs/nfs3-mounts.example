@@ -1,0 +1,10 @@
+# Example /etc/fstab entries on the source/controller VM and destination VM.
+# Replace server:/export with the actual NFSv3 server export and verify options
+# supported by your NFS server, client kernel, network, and storage platform.
+# Source/controller VM:
+192.0.2.10:/source-export      /mnt/nfs_source      nfs  rw,vers=3,proto=tcp,hard,timeo=600,retrans=2,rsize=262144,wsize=262144,noatime,_netdev 0 0
+# Destination VM:
+192.0.2.20:/destination-export /mnt/nfs_destination nfs  rw,vers=3,proto=tcp,hard,timeo=600,retrans=2,rsize=262144,wsize=262144,noatime,_netdev 0 0
+
+# nconnect is optional and kernel/server dependent. Benchmark nconnect=4 or 8
+# only if supported by your RHEL 8 kernel and NFS server. Do not copy blindly.

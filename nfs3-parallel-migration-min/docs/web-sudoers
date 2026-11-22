@@ -1,0 +1,8 @@
+# Optional /etc/sudoers.d/nfs3-migrate-web on the controller VM.
+# Review the web/API code and protect Apache with HTTPS + strong authentication.
+apache ALL=(root) NOPASSWD: /usr/local/sbin/nfs3-migrate preflight
+apache ALL=(root) NOPASSWD: /usr/local/sbin/nfs3-migrate validate-counts
+apache ALL=(root) NOPASSWD: /usr/local/sbin/nfs3-migrate validate-checksum
+apache ALL=(root) NOPASSWD: /usr/local/sbin/nfs3-migrate retry
+apache ALL=(root) NOPASSWD: /usr/local/sbin/nfs3-migrate-web-start
+apache ALL=(root) NOPASSWD: /usr/local/sbin/nfs3-migrate final-sync
