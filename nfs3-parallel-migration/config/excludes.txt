@@ -1,0 +1,2 @@
+# One rsync exclude pattern per line.
+# Review carefully. Do not exclude application data accidentally.

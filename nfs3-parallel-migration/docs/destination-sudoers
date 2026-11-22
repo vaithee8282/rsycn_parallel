@@ -1,0 +1,3 @@
+# /etc/sudoers.d/nfs3-migrate on destination VM.
+# The dedicated account is restricted by SSH/network policy.
+nfs3-migrate ALL=(root) NOPASSWD: /usr/bin/rsync
